@@ -13,7 +13,6 @@
 #include <zephyr/shell/shell.h>
 #include <zephyr/shell/shell_uart.h>
 #include "chat_cli.h"
-#include "battery_adc.h"
 #include "model_handler.h"
 #include <stdlib.h>
 #include <zephyr/logging/log.h>
@@ -23,6 +22,41 @@ extern struct dsdv_route_entry g_dsdv_routes[];
 LOG_MODULE_DECLARE(chat);
 
 static const struct shell *chat_shell;
+
+/******************************************************************************/
+/*************************** LED Blink Function *******************************/
+/******************************************************************************/
+static struct k_work_delayable led_blink_work;
+static int blink_count_remaining = 0;
+
+static void led_blink_work_handler(struct k_work *work)
+{
+	if (blink_count_remaining > 0) {
+		// Toggle LED
+		static bool led_state = false;
+		if (!led_state) {
+			dk_set_led_on(DK_LED1);
+			led_state = true;
+			k_work_reschedule(&led_blink_work, K_MSEC(1000));
+		} else {
+			dk_set_led_off(DK_LED1);
+			led_state = false;
+			blink_count_remaining--;
+			if (blink_count_remaining > 0) {
+				k_work_reschedule(&led_blink_work, K_MSEC(1000));
+			}
+		}
+	}
+}
+
+void mesh_led_blink(int count)
+{
+	if (count <= 0) {
+		return;
+	}
+	blink_count_remaining = count;
+	k_work_reschedule(&led_blink_work, K_MSEC(1000));
+}
 
 /******************************************************************************/
 /*************************** Health server setup ******************************/
@@ -45,6 +79,69 @@ struct metrics_cache_entry
 	uint32_t last_latency_us;  // Store calculated latency
 };
 static struct metrics_cache_entry metrics_cache[16];  // 4x4 nodes max
+
+// Relay metrics cache - stores metrics from intermediate nodes
+struct relay_metrics_cache_entry
+{
+	uint16_t relay_addr;           // Address of relay node
+	uint16_t original_src;         // Original packet source
+	uint32_t original_seq;         // Original packet sequence
+	struct bt_mesh_network_metrics relay_metrics;  // Full relay node metrics
+	uint32_t timestamp;            // When received
+	uint8_t measurement_count;     // How many times seen
+};
+static struct relay_metrics_cache_entry relay_cache[16];  // Store up to 16 relay metrics
+
+static void store_relay_metrics_to_cache(uint16_t relay_addr, 
+                                         uint16_t original_src,
+                                         uint32_t original_seq,
+                                         const struct bt_mesh_network_metrics *metrics)
+{
+    // Find existing entry for this relay node
+    for (int i = 0; i < ARRAY_SIZE(relay_cache); i++) {
+        if (relay_cache[i].relay_addr == relay_addr && 
+            relay_cache[i].original_src == original_src) {
+            // Update existing entry
+            relay_cache[i].original_seq = original_seq;
+            relay_cache[i].relay_metrics = *metrics;
+            relay_cache[i].timestamp = k_uptime_get_32();
+            relay_cache[i].measurement_count++;
+            return;
+        }
+    }
+    
+    // Find empty slot
+    for (int i = 0; i < ARRAY_SIZE(relay_cache); i++) {
+        if (relay_cache[i].relay_addr == 0) {
+            relay_cache[i].relay_addr = relay_addr;
+            relay_cache[i].original_src = original_src;
+            relay_cache[i].original_seq = original_seq;
+            relay_cache[i].relay_metrics = *metrics;
+            relay_cache[i].timestamp = k_uptime_get_32();
+            relay_cache[i].measurement_count = 1;
+            return;
+        }
+    }
+    
+    // Cache full - use LRU replacement (find oldest)
+    int oldest_idx = 0;
+    uint32_t oldest_time = relay_cache[0].timestamp;
+    for (int i = 1; i < ARRAY_SIZE(relay_cache); i++) {
+        if (relay_cache[i].timestamp < oldest_time) {
+            oldest_idx = i;
+            oldest_time = relay_cache[i].timestamp;
+        }
+    }
+    
+    // Replace oldest entry
+    relay_cache[oldest_idx].relay_addr = relay_addr;
+    relay_cache[oldest_idx].original_src = original_src;
+    relay_cache[oldest_idx].original_seq = original_seq;
+    relay_cache[oldest_idx].relay_metrics = *metrics;
+    relay_cache[oldest_idx].timestamp = k_uptime_get_32();
+    relay_cache[oldest_idx].measurement_count = 1;
+}
+
 static void store_metrics_to_cache(const struct bt_mesh_network_metrics *metrics)
 {
     // Tìm hoặc tạo entry trong cache
@@ -106,8 +203,6 @@ static void handle_network_metrics(struct bt_mesh_chat_cli *chat,
 	// Print concise ASCII-only metrics
 	shell_print(chat_shell, "NETWORK METRICS");
 	shell_print(chat_shell, "From: 0x%04X  About: 0x%04X", metrics->src_addr, metrics->about_addr);
-	shell_print(chat_shell, "Battery: %u%% | RSSI: %d dBm | Hops: %u | Latency: %u ms",
-				metrics->battery_pct, metrics->rssi_dbm, metrics->hop_count, latency_ms);
 	shell_print(chat_shell, "TTL: %u/%u (TTL-hops: %u) | Congestion: %u | Req-ACK: %u",
 				metrics->initial_ttl, ttl_final, ttl_hops, metrics->congestion, metrics->request_ack);
 	shell_print(chat_shell, "Timestamp: %u ms | Method: %s",
@@ -138,6 +233,17 @@ static void handle_metrics_ack(struct bt_mesh_chat_cli *chat,
 			ack->src_addr, rtt, latency);
 	update_latency_in_cache(ack->src_addr, latency);
 };
+
+// Public function to store relay metrics (called from chat_cli.c)
+void store_relay_metrics(uint16_t relay_addr, 
+                        uint16_t original_src,
+                        uint32_t original_seq,
+                        const struct bt_mesh_network_metrics *metrics)
+{
+	store_relay_metrics_to_cache(relay_addr, original_src, original_seq, metrics);
+	LOG_INF("Stored relay metrics from 0x%04x (src=0x%04x, seq=%u)", 
+	        relay_addr, original_src, (unsigned)original_seq);
+}
 
 static const struct bt_mesh_chat_cli_handlers chat_handlers = {
 	.start = handle_chat_start,
@@ -242,33 +348,6 @@ static int cmd_structure_to(const struct shell *shell, size_t argc, char *argv[]
     return 0;
 }
 
-static int cmd_convergence_to(const struct shell *shell, size_t argc, char *argv[])
-{
-    uint16_t target_addr;
-    int err;
-
-    if (argc < 2) {
-        shell_error(shell, "Usage: convergence_to <addr>");
-        return -EINVAL;
-    }
-
-    target_addr = strtol(argv[1], NULL, 0);
-
-    if (target_addr == 0 || target_addr > 0x7FFF) {
-        shell_error(shell, "Invalid target address: 0x%04X", target_addr);
-        return -EINVAL;
-    }
-
-    err = bt_mesh_chat_cli_convergence_request(&chat, target_addr);
-    if (err) {
-        shell_error(shell, "Failed to request convergence stats from 0x%04X: %d", target_addr, err);
-        return err;
-    }
-
-    shell_print(shell, "Convergence stats request sent to 0x%04X", target_addr);
-    return 0;
-}
-
 static int cmd_show_routes(const struct shell *shell, size_t argc, char *argv[])
 {
     shell_print(shell, "DSDV Routing Table:");
@@ -367,40 +446,6 @@ static int cmd_neighbor_rssi(const struct shell *shell, size_t argc, char **argv
     return 0;
 }
 
-static int cmd_battery(const struct shell *shell, size_t argc, char **argv)
-{
-#ifdef CONFIG_ADC
-    uint16_t voltage_mv;
-    int err = battery_adc_read_mv(&voltage_mv);
-    
-    if (err) {
-        shell_error(shell, "Failed to read battery voltage: %d", err);
-        return err;
-    }
-    
-    uint8_t percent = battery_voltage_to_percent(voltage_mv);
-    
-    shell_print(shell, "Battery Status:");
-    shell_print(shell, "  Voltage: %u mV", voltage_mv);
-    shell_print(shell, "  Percentage: %u%%", percent);
-    
-    // Show battery status indicator
-    if (percent >= 80) {
-        shell_print(shell, "  Status: GOOD [████████░░]");
-    } else if (percent >= 50) {
-        shell_print(shell, "  Status: OK   [██████░░░░]");
-    } else if (percent >= 20) {
-        shell_print(shell, "  Status: LOW  [███░░░░░░░]");
-    } else {
-        shell_print(shell, "  Status: CRITICAL [█░░░░░░░░░]");
-    }
-#else
-    shell_print(shell, "Battery ADC not configured");
-    shell_print(shell, "Add CONFIG_ADC=y to prj.conf");
-#endif
-    return 0;
-}
-
 static int cmd_clear_history(const struct shell *shell, size_t argc, char **argv)
 {
     bt_mesh_chat_cli_clear_route_history();
@@ -414,25 +459,85 @@ static int cmd_show_history(const struct shell *shell, size_t argc, char **argv)
     return 0;
 }
 
+static int cmd_show_relay_metrics(const struct shell *shell, size_t argc, char **argv)
+{
+    uint8_t count = 0;
+    
+    // Count valid entries
+    for (int i = 0; i < ARRAY_SIZE(relay_cache); i++) {
+        if (relay_cache[i].relay_addr != 0) {
+            count++;
+        }
+    }
+    
+    if (count == 0) {
+        shell_print(shell, "No relay metrics available");
+        return 0;
+    }
+    
+    shell_print(shell, "\n=== RELAY METRICS CACHE (%u entries) ===", count);
+    shell_print(shell, "");
+    
+    for (int i = 0; i < ARRAY_SIZE(relay_cache); i++) {
+        if (relay_cache[i].relay_addr == 0) {
+            continue;  // Skip empty slot
+        }
+        
+        struct relay_metrics_cache_entry *entry = &relay_cache[i];
+        struct bt_mesh_network_metrics *m = &entry->relay_metrics;
+        
+        // Calculate weak node percentage
+        uint8_t weak_node_pct = 0;
+        if (m->neighbor_count > 0) {
+            uint8_t weak_count = 0;
+            for (int j = 0; j < m->neighbor_count; j++) {
+                if (m->neighbor_rssi[j].rssi < -80) {
+                    weak_count++;
+                }
+            }
+            weak_node_pct = (weak_count * 100) / m->neighbor_count;
+        }
+        
+        // Calculate age
+        uint32_t age_s = (k_uptime_get_32() - entry->timestamp) / 1000;
+        
+        shell_print(shell, "Relay Node: 0x%04x (src=0x%04x, seq=%u, count=%u, age=%us)",
+                    entry->relay_addr, entry->original_src, 
+                    (unsigned)entry->original_seq, entry->measurement_count, age_s);
+        shell_print(shell, " Neighbors: %u | Weak: %u%% | Congestion: %u‰", m->neighbor_count, weak_node_pct, m->congestion);
+        
+        if (m->neighbor_count > 0) {
+            shell_print(shell, "  Neighbors RSSI:");
+            for (int j = 0; j < m->neighbor_count; j++) {
+                shell_print(shell, "    0x%04x: %d dBm%s",
+                            m->neighbor_rssi[j].addr,
+                            m->neighbor_rssi[j].rssi,
+                            (m->neighbor_rssi[j].rssi < -80) ? " (WEAK)" : "");
+            }
+        }
+        shell_print(shell, "");
+    }
+    
+    return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(chat_cmds,
 	SHELL_CMD_ARG(status, NULL, "Print client status", cmd_status, 1, 0),
 	SHELL_CMD_ARG(metrics_to, NULL, "Send metrics to specific node <addr> via DSDV",
 		      cmd_metrics_to, 2, 0),
 	SHELL_CMD_ARG(structure_to, NULL, "Request network structure from node <addr>",
 		      cmd_structure_to, 2, 0),
-	SHELL_CMD_ARG(convergence_to, NULL, "Request convergence statistics from node <addr>",
-		      cmd_convergence_to, 2, 0),
 	SHELL_CMD_ARG(routes, NULL,"Show DSDV routing table",cmd_show_routes, 1, 0),
 	SHELL_CMD_ARG(verify_route, NULL, "Verify route to <addr> by sending metrics",
 		      cmd_verify_route, 2, 0),
 	SHELL_CMD_ARG(neighbors, NULL, "Show per-neighbor RSSI",
 		      cmd_neighbor_rssi, 1, 0),
-	SHELL_CMD_ARG(battery, NULL, "Show battery voltage and percentage",
-		      cmd_battery, 1, 0),
 	SHELL_CMD_ARG(clear_history, NULL, "Clear route metrics history",
 		      cmd_clear_history, 1, 0),
 	SHELL_CMD_ARG(show_history, NULL, "Show route metrics comparison table",
 		      cmd_show_history, 1, 0),
+	SHELL_CMD_ARG(relay_metrics, NULL, "Show relay node metrics cache",
+		      cmd_show_relay_metrics, 1, 0),
 	SHELL_SUBCMD_SET_END
 );
 
@@ -458,6 +563,9 @@ SHELL_CMD_ARG_REGISTER(chat, &chat_cmds, "Bluetooth Mesh Chat Client commands",
 const struct bt_mesh_comp *model_handler_init(void)
 {
 	chat_shell = shell_backend_uart_get_ptr();
+	
+	// Initialize LED blink work queue
+	k_work_init_delayable(&led_blink_work, led_blink_work_handler);
 
 	return &comp;
 }

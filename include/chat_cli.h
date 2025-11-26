@@ -5,10 +5,16 @@
  */
 
 /**
- * @file
- * @defgroup bt_mesh_chat_cli
+ * @file chat_cli.h
+ * @defgroup bt_mesh_chat_cli Bluetooth Mesh Chat Client Model API
  * @{
- * @brief API for the Bluetooth Mesh Chat Client model.
+ * @brief API for the Bluetooth Mesh Chat Client model with DSDV routing
+ * 
+ * This model implements:
+ * - DSDV (Destination-Sequenced Distance-Vector) proactive routing protocol
+ * - Network metrics collection (battery, RSSI, congestion, neighbor quality)
+ * - Automatic expired route filtering (45s timeout)
+ * - Remote structure querying
  */
 
 #ifndef BT_MESH_CHAT_CLI_H__
@@ -21,91 +27,172 @@
 extern "C" {
 #endif
 
-/* .. include_startingpoint_chat_cli_rst_1 */
+/* ============================================================================
+ * MODEL IDENTIFICATION
+ * ============================================================================ */
+
 /** Company ID of the Bluetooth Mesh Chat Client model. */
 #define BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID    CONFIG_BT_COMPANY_ID_NORDIC
 
 /** Model ID of the Bluetooth Mesh Chat Client model. */
 #define BT_MESH_CHAT_CLI_VENDOR_MODEL_ID      0x000A
 
+/* ============================================================================
+ * OPCODES - Mesh message operation codes
+ * ============================================================================ */
+
+/** Opcode: Metrics acknowledgment packet */
 #define BT_MESH_CHAT_CLI_OP_METRICS_ACK BT_MESH_MODEL_OP_3(0x0F, \
                                        BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
-#define BT_MESH_CHAT_CLI_OP_NETWORK_METRICS BT_MESH_MODEL_OP_3(0x11, \
-									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
+/** Opcode: DSDV HELLO packet (neighbor discovery + RSSI) */
 #define BT_MESH_CHAT_CLI_OP_DSDV_HELLO BT_MESH_MODEL_OP_3(0x12, \
 									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
+
+/** Opcode: DSDV UPDATE packet (routing table exchange) */
 #define BT_MESH_CHAT_CLI_OP_DSDV_UPDATE BT_MESH_MODEL_OP_3(0x13, \
 									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
+
+/** Opcode: DSDV DATA packet (end-to-end data with metrics) */
 #define BT_MESH_CHAT_CLI_OP_DSDV_DATA BT_MESH_MODEL_OP_3(0x14, \
 									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
+
+/** Opcode: Relay metrics packet (metrics from intermediate nodes) */
 #define BT_MESH_CHAT_CLI_OP_RELAY_METRICS BT_MESH_MODEL_OP_3(0x15, \
 									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
+
+/** Opcode: Structure request packet (query routing table) */
 #define BT_MESH_CHAT_CLI_OP_STRUCTURE_REQUEST BT_MESH_MODEL_OP_3(0x16, \
 									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
-#define BT_MESH_CHAT_CLI_OP_CONVERGENCE_REQUEST BT_MESH_MODEL_OP_3(0x17, \
-									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
+
+/* ============================================================================
+ * MESSAGE LENGTH CONSTANTS
+ * ============================================================================ */
 									   
-#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_HELLO 8
-#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_UPDATE_MIN 8
-#define BT_MESH_CHAT_CLI_MSG_LEN_NETWORK_METRICS 15
-#define BT_MESH_CHAT_CLI_MSG_LEN_METRICS_ACK 8
-#define BT_MESH_CHAT_CLI_MSG_LEN_RELAY_METRICS sizeof(struct relay_metrics_packet)
+#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_HELLO 8                /**< HELLO packet size */
+#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_UPDATE_MIN 8           /**< Minimum UPDATE packet size */
+// #define BT_MESH_CHAT_CLI_MSG_LEN_NETWORK_METRICS 15       /**< DEPRECATED: Legacy standalone metrics */
+#define BT_MESH_CHAT_CLI_MSG_LEN_METRICS_ACK 8               /**< Metrics ACK packet size */
+#define BT_MESH_CHAT_CLI_MSG_LEN_RELAY_METRICS sizeof(struct relay_metrics_packet)  /**< Relay metrics size */
+#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_DATA_MAX 128           /**< Maximum DATA packet size */
 
-#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_DATA_MAX 128
+/* ============================================================================
+ * DATA STRUCTURES - Packet formats and routing table entries
+ * ============================================================================ */
 
-// Per-neighbor RSSI entry
+/**
+ * @brief Per-neighbor RSSI tracking entry
+ * 
+ * Stores RSSI measurement for each neighbor to enable link quality
+ * assessment and route selection.
+ */
 struct neighbor_rssi_entry {
-	uint16_t addr;
-	int8_t rssi;
+	uint16_t addr;  /**< Neighbor node address */
+	int8_t rssi;    /**< RSSI value in dBm */
 } __packed;
 
-#define MAX_NEIGHBORS_IN_METRICS 8  // Restored to 8
+/** Maximum number of neighbors to include in metrics packet */
+#define MAX_NEIGHBORS_IN_METRICS 8
 
+/**
+ * @brief Network metrics packet structure
+ * 
+ * Contains comprehensive network performance metrics from a node:
+ * - Link quality (RSSI to target and all neighbors)
+ * - Network load (congestion percentage)
+ * - Packet delivery info (TTL, hop count)
+ */
 struct bt_mesh_network_metrics
 {
-	uint16_t src_addr;
-	uint16_t about_addr;
-	uint32_t timestamp;
-	uint8_t battery_pct;
-	int8_t rssi_dbm;           // RSSI to about_addr (for backward compatibility)
-	uint16_t congestion;
-	uint8_t initial_ttl;
-	uint8_t hop_count;
-	uint8_t request_ack;
-	uint8_t neighbor_count;    // Number of neighbors in neighbor_rssi[]
-	struct neighbor_rssi_entry neighbor_rssi[MAX_NEIGHBORS_IN_METRICS];
+	uint16_t src_addr;      /**< Source node address */
+	uint16_t about_addr;    /**< Target node address (for directed metrics) */
+	uint32_t timestamp;     /**< Metric collection timestamp (ms) */
+	int8_t rssi_dbm;        /**< RSSI to about_addr in dBm */
+	uint8_t _padding;       /**< Padding for alignment */
+	uint16_t congestion;    /**< Congestion level (failures per 1000 sends) */
+	uint8_t initial_ttl;    /**< TTL used for packet transmission */
+	uint8_t hop_count;      /**< Number of hops from source */
+	uint8_t request_ack;    /**< 1 = request acknowledgment, 0 = no ACK needed */
+	uint8_t neighbor_count; /**< Number of valid entries in neighbor_rssi[] */
+	struct neighbor_rssi_entry neighbor_rssi[MAX_NEIGHBORS_IN_METRICS]; /**< All neighbor link qualities */
 }__packed;
 
+/**
+ * @brief Metrics acknowledgment packet
+ * 
+ * Sent by destination to confirm metrics packet delivery.
+ * Enables RTT (Round Trip Time) calculation.
+ */
 struct bt_mesh_metrics_ack{
-	uint16_t src_addr;           // Original sender
-	uint32_t original_timestamp; // Echo timestamp cho RTT
-	uint16_t padding;            // Để đủ 8 bytes
+	uint16_t src_addr;           /**< Original sender address */
+	uint32_t original_timestamp; /**< Echo of original timestamp for RTT calculation */
+	uint16_t padding;            /**< Padding to reach 8 bytes */
 } __packed;
 
+/**
+ * @brief DSDV routing table entry
+ * 
+ * Stores routing information for one destination in the network.
+ * Updated when receiving HELLO or UPDATE packets.
+ */
 struct dsdv_route_entry {
-	uint16_t dest;
-	uint16_t next_hop;
-	uint8_t hop_count;
-	uint8_t flags;
-	uint32_t seq_num;
-	uint32_t last_update_time;  // Timestamp of last update
-	int8_t rssi;  // RSSI to next_hop (for route quality assessment)
+	uint16_t dest;               /**< Destination node address */
+	uint16_t next_hop;           /**< Next hop node address to reach dest */
+	uint8_t hop_count;           /**< Number of hops to destination (0xFF = invalidation) */
+	uint32_t seq_num;            /**< Sequence number from destination (freshness / odd=invalid) */
+	uint32_t last_update_time;   /**< Last successful update time (ms) */
+	uint8_t tentative;           /**< 1 = route learned without confirmed HELLO yet */
+	uint8_t fail_streak;         /**< Consecutive send failures via this route */
+	uint8_t dirty;               /**< 1 = needs to be advertised in next incremental UPDATE */
+	uint8_t _pad;                /**< Padding for alignment */
 }__packed;
 
+/**
+ * @brief DSDV HELLO packet structure
+ * 
+ * Broadcast every ~5 seconds for neighbor discovery.
+ * Receivers create 1-hop routes and measure RSSI.
+ */
 struct dsdv_hello {
-    uint16_t src;
-    uint32_t seq_num; // seq của chính node này (đích = chính nó)
-    uint16_t flags;   // reserved
+    uint16_t src;       /**< Source node address */
+    uint32_t seq_num;   /**< Source's sequence number (even numbers only) */
+    uint16_t flags;     /**< Reserved for future use */
 } __packed;
 
+/**
+ * @brief DSDV UPDATE packet header
+ * 
+ * Followed by num_entries route entries.
+ * Shares routing table with neighbors for multi-hop routing.
+ */
 struct dsdv_update_header {
-	uint16_t src;
-	uint8_t num_entries;
-	uint8_t flags;
+	uint16_t src;         /**< Source node address */
+	uint8_t num_entries;  /**< Number of route entries following this header */
+	uint8_t flags;        /**< Reserved flags */
 } __packed;
 
+/**
+ * @brief DSDV UPDATE route entry payload
+ * 
+ * Sent in UPDATE packets. Does NOT include next_hop because:
+ * - Receiver will set next_hop = sender_address
+ * - Including next_hop would cause routing errors (transitive next_hop)
+ */
+struct dsdv_update_entry {
+	uint16_t dest;        /**< Destination node address */
+	uint8_t hop_count;    /**< Number of hops from sender to dest */
+	uint32_t seq_num;     /**< Sequence number from destination */
+	uint8_t padding;      /**< Padding for alignment */
+} __packed;
+
+/** Maximum number of nodes in path vector for DATA packets */
 #define MAX_PATH_NODES 8
 
+/**
+ * @brief DSDV DATA packet structure
+ * 
+ * End-to-end data delivery with embedded metrics and path tracking.
+ * Supports relay metrics collection for network analysis.
+ */
 struct dsdv_data_packet {
 	uint16_t src;
 	uint16_t dest;
@@ -129,12 +216,6 @@ struct relay_metrics_packet {
 
 // Network structure request packet (destination will print its routing table)
 struct structure_request_packet {
-	uint16_t requester_addr;
-	uint32_t request_seq;
-} __packed;
-
-// Convergence statistics request packet
-struct convergence_request_packet {
 	uint16_t requester_addr;
 	uint32_t request_seq;
 } __packed;
@@ -199,8 +280,8 @@ struct bt_mesh_chat_cli {
 	/** Publication message. */
 	struct net_buf_simple pub_msg;
 	/** Publication message buffer. */
-	uint8_t buf[BT_MESH_MODEL_BUF_LEN(BT_MESH_CHAT_CLI_OP_METRICS_ACK,
-					  32)];
+	uint8_t buf[BT_MESH_MODEL_BUF_LEN(BT_MESH_CHAT_CLI_OP_DSDV_UPDATE,
+					  BT_MESH_CHAT_CLI_MSG_LEN_DSDV_DATA_MAX)];
 	/** Handler function structure. */
 	const struct bt_mesh_chat_cli_handlers *handlers;
 };
@@ -278,22 +359,6 @@ void bt_mesh_chat_cli_show_route_history(void);
  * @retval -ENOENT No route to destination.
  */
 int bt_mesh_chat_cli_structure_request(struct bt_mesh_chat_cli *chat, uint16_t dest);
-
-/**
- * @brief Request convergence statistics from a node
- *
- * Sends a convergence stats request to the specified node. The target node 
- * will print its network reconfiguration statistics including convergence 
- * time, total reconfigurations, and min/max values.
- *
- * @param[in] chat Chat Client model instance.
- * @param[in] dest Destination unicast address to request stats from.
- *
- * @retval 0 on success.
- * @retval -EINVAL Invalid arguments or destination address.
- * @retval -ENOENT No route to destination.
- */
-int bt_mesh_chat_cli_convergence_request(struct bt_mesh_chat_cli *chat, uint16_t dest);
 
 /** @cond INTERNAL_HIDDEN */
 extern const struct bt_mesh_model_op _bt_mesh_chat_cli_op[];

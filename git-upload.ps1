@@ -1,9 +1,9 @@
 # Script upload code lên GitHub
 # Sửa các thông tin sau:
-$GITHUB_USERNAME = "your-username"  # ← Thay đổi
-$REPO_NAME = "bluetooth-mesh-dsdv"  # ← Thay đổi
-$YOUR_NAME = "Your Name"            # ← Thay đổi
-$YOUR_EMAIL = "your@email.com"      # ← Thay đổi
+$GITHUB_USERNAME = "Cgminhh1102"  # ← Thay đổi
+$REPO_NAME = "kltn"  # ← Thay đổi
+$YOUR_NAME = "vinh"            # ← Thay đổi
+$YOUR_EMAIL = "21020697@vnu.edu.vn"      # ← Thay đổi
 
 Write-Host "=== UPLOADING TO GITHUB ===" -ForegroundColor Green
 
